@@ -132,37 +132,35 @@ def extract_questions_from_s3(s3_key: str) -> list[dict]:
     return questions
 
 def query_knowledge_base(question: str) -> dict:
+    import boto3
+    from groq import Groq
+    import os
     try:
-        response = bedrock.retrieve_and_generate(
-            input={"text": question},
-            retrieveAndGenerateConfiguration={
-                "type": "KNOWLEDGE_BASE",
-                "knowledgeBaseConfiguration": {
-                    "knowledgeBaseId": KNOWLEDGE_BASE_ID,
-                    "modelArn": MODEL_ARN,
-                    "retrievalConfiguration": {
-                        "vectorSearchConfiguration": {"numberOfResults": 5}
-                    },
-                    "generationConfiguration": {
-                        "promptTemplate": {
-                            "textPromptTemplate": (
-                                "You are a security compliance expert. "
-                                "Answer the following security questionnaire question "
-                                "based ONLY on the provided policy documents. "
-                                "Be specific, cite the policy section where possible, "
-                                "and be concise (2-4 sentences). "
-                                "If the information is not in the documents, say so clearly.\n\n"
-                                "Question: $query$\n\nContext:\n$search_results$"
-                            )
-                        }
-                    },
-                },
-            },
+        bedrock_retrieval = boto3.client("bedrock-agent-runtime", region_name="us-east-1")
+        retrieval_response = bedrock_retrieval.retrieve(
+            knowledgeBaseId=KNOWLEDGE_BASE_ID,
+            retrievalQuery={"text": question},
+            retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 5}}
         )
-        return {"answer": response["output"]["text"], "sources": response.get("citations", [])}
+        results = retrieval_response.get("retrievalResults", [])
+        context = "\n\n".join([r["content"]["text"] for r in results])
+        sources = results
     except Exception as e:
-        logger.error(f"Bedrock error: {e}")
-        return {"answer": "Unable to retrieve answer from knowledge base.", "sources": []}
+        logger.warning(f"KB retrieval failed: {e}")
+        context = "No context available."
+        sources = []
+    try:
+        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": f"You are a security compliance expert. Answer this security questionnaire question based ONLY on the provided policy documents. Be specific and concise (2-4 sentences). If not in documents, say so clearly.\n\nQuestion: {question}\n\nPolicy context:\n{context}"}],
+            max_tokens=300
+        )
+        answer = response.choices[0].message.content
+        return {"answer": answer, "sources": sources}
+    except Exception as e:
+        logger.error(f"Groq error: {e}")
+        return {"answer": "Unable to generate answer.", "sources": []}
 
 def trigger_kb_sync():
     try:
